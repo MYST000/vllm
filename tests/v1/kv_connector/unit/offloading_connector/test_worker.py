@@ -151,6 +151,20 @@ def _empty_metadata() -> OffloadingConnectorMetadata:
     return OffloadingConnectorMetadata(load_jobs={}, store_jobs={})
 
 
+def test_rejected_store_reports_quiesced_failure_without_finished_sending():
+    worker, _ = _make_worker(
+        KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
+    )
+    worker.worker.submit_store.return_value = False
+    worker.worker.get_finished.return_value = []
+    worker.prepare_store_kv(_store_metadata(7))
+    worker.start_kv_transfers(_empty_metadata())
+    assert worker.get_finished(set()) == (set(), set())
+    meta = worker.build_connector_worker_meta()
+    assert meta.completed_jobs == {7: 1}
+    assert meta.failed_jobs[7]
+
+
 def _offloading_config(rank: int = 0) -> OffloadingConfig:
     return OffloadingConfig(
         groups=(),

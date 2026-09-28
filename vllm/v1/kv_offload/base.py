@@ -537,6 +537,8 @@ class CanonicalKVCaches:
 
 @dataclass
 class TransferResult:
+    """Terminal transfer result: no worker DMA may still access its buffers."""
+
     job_id: int
     success: bool
     transfer_size: int | None = None
@@ -552,7 +554,11 @@ class OffloadingWorker(ABC):
     def submit_store(
         self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
     ) -> bool:
-        """Async GPU -> offloaded medium."""
+        """Async GPU -> offloaded medium.
+
+        False rejects submission without leaving any DMA accessing its buffers.
+        Exceptions, including fatal CUDA errors, propagate to engine failure.
+        """
 
     @abstractmethod
     def submit_load(

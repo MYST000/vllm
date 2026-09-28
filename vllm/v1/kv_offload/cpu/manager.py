@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
-from collections.abc import Collection, Iterable
+from collections.abc import Callable, Collection, Iterable
 
 from typing_extensions import override
 
@@ -51,6 +51,8 @@ class CPUOffloadingManager(OffloadingManager):
         self.medium: Medium = Medium.CPU
         self._num_blocks: int = num_blocks
         self._num_allocated_blocks: int = 0
+        self._allocation_generation: int = 0
+        self.state_observer: Callable[[Collection[OffloadKey]], None] | None = None
         self._free_list: list[int] = []
         self.events: list[OffloadingEvent] | None = [] if enable_events else None
         policy_cls = CachePolicyFactory.get_cache_policy_cls(
@@ -91,7 +93,42 @@ class CPUOffloadingManager(OffloadingManager):
         # allocate reused blocks
         for _ in range(num_reused):
             blocks.append(BlockStatus(self._free_list.pop()))
+        for block in blocks:
+            self._allocation_generation += 1
+            block.allocation_generation = self._allocation_generation
         return blocks
+
+    def replica_state(self, key: OffloadKey) -> tuple[int, int, bool, int] | None:
+        """Read allocation, generation, readiness and refs without touching LRU."""
+        block = self._policy.get(key)
+        if block is None:
+            return None
+        return (
+            block.block_id,
+            block.allocation_generation,
+            block.is_ready,
+            block.ref_cnt,
+        )
+
+    def evict_if_idle(self, key: OffloadKey, expected_generation: int) -> str:
+        """Delete a specific idle replica after the engine checks shared demand."""
+        block = self._policy.get(key)
+        if block is None:
+            return "ABSENT"
+        if block.allocation_generation != expected_generation:
+            return "STALE_ALLOCATION"
+        if not block.is_ready or block.ref_cnt:
+            return "IN_FLIGHT"
+        self._policy.remove(key)
+        self._num_evictable_cache_blocks -= 1
+        self._free_block(block)
+        if self.state_observer is not None:
+            self.state_observer([key])
+        if self.events is not None:
+            self.events.append(
+                OffloadingEvent(keys=[key], medium=self.medium, removed=True)
+            )
+        return "APPLIED"
 
     def _free_block(self, block: BlockStatus) -> None:
         self._free_list.append(block.block_id)
@@ -146,6 +183,8 @@ class CPUOffloadingManager(OffloadingManager):
                 assert self._num_evictable_cache_blocks >= 0
             block.ref_cnt += 1
             blocks.append(block)
+        if self.state_observer is not None:
+            self.state_observer(keys)
         return self._get_load_store_spec(keys, blocks)
 
     @override
@@ -164,6 +203,8 @@ class CPUOffloadingManager(OffloadingManager):
             if block.ref_cnt == 0:
                 self._num_evictable_cache_blocks += 1  # ref_cnt 1 -> 0
                 self._policy.mark_evictable(key)
+        if self.state_observer is not None:
+            self.state_observer(keys)
 
     @override
     def prepare_store(
@@ -233,6 +274,8 @@ class CPUOffloadingManager(OffloadingManager):
 
         # build store specs for allocated blocks
         store_spec = self._get_load_store_spec(keys_to_store, blocks)
+        if self.state_observer is not None:
+            self.state_observer(keys_to_store + to_evict)
 
         return PrepareStoreOutput(
             keys_to_store=keys_to_store,
@@ -274,6 +317,9 @@ class CPUOffloadingManager(OffloadingManager):
                     removed=False,
                 )
             )
+
+        if self.state_observer is not None:
+            self.state_observer(keys)
 
     @override
     def reset_cache(self) -> None:

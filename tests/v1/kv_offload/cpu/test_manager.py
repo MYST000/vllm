@@ -35,6 +35,38 @@ def make_req_context(
 _EMPTY_REQ_CTX = make_req_context()
 
 
+@pytest.mark.parametrize("policy", ["lru", "arc"])
+def test_targeted_evict_respects_transfers_and_allocation_generation(policy):
+    manager = CPUOffloadingManager(
+        1, cache_policy=policy, enable_events=True, store_threshold=0
+    )
+    key = to_key(1)
+    assert manager.prepare_store([key], _EMPTY_REQ_CTX) is not None
+    replica = manager.replica_state(key)
+    assert replica is not None
+    generation = replica[1]
+    assert manager.evict_if_idle(key, generation) == "IN_FLIGHT"
+    manager.complete_store([key], _EMPTY_REQ_CTX)
+    manager.prepare_load([key], _EMPTY_REQ_CTX)
+    assert manager.evict_if_idle(key, generation) == "IN_FLIGHT"
+    manager.complete_load([key], _EMPTY_REQ_CTX)
+    assert manager.evict_if_idle(key, generation) == "APPLIED"
+    assert manager.evict_if_idle(key, generation) == "ABSENT"
+    assert manager._get_num_free_blocks() == 1
+    assert manager._num_evictable_cache_blocks == 0
+
+    assert manager.prepare_store([key], _EMPTY_REQ_CTX) is not None
+    manager.complete_store([key], _EMPTY_REQ_CTX)
+    assert manager.evict_if_idle(key, generation) == "STALE_ALLOCATION"
+    assert manager.lookup(key, _EMPTY_REQ_CTX) == LookupResult.HIT
+    replica = manager.replica_state(key)
+    assert replica is not None
+    assert replica[1] > generation
+    manager.reset_cache()
+    assert manager.prepare_store([key], _EMPTY_REQ_CTX) is not None
+    assert manager.replica_state(key)[1] > replica[1]
+
+
 def make_cpu_manager(
     num_blocks: int = 4,
     cache_policy: str = "lru",

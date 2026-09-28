@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -70,6 +70,13 @@ class BlockHashToBlockMap:
                 return next(iter(blocks.values()))
             self._unexpected_blocks_type(blocks)
         return None
+
+    def get_all_blocks(self, key: BlockHashWithGroupId) -> tuple[KVCacheBlock, ...]:
+        """Return every physical replica without changing cache order."""
+        blocks = self._cache.get(key)
+        if blocks is None:
+            return ()
+        return (blocks,) if isinstance(blocks, KVCacheBlock) else tuple(blocks.values())
 
     def contain(self, key: BlockHashWithGroupId, block_id: int) -> bool:
         """
@@ -194,6 +201,9 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+        # Optional engine-thread metadata observer and soft eviction selector.
+        self.state_observer: Callable[[KVCacheBlock, str], None] | None = None
+        self.free_block_selector: Callable[[int], list[KVCacheBlock]] | None = None
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -575,9 +585,13 @@ class BlockPool:
         block_hashes: list[BlockHashWithGroupId] = []
         if block.block_hash is not None:
             block_hashes.append(block.block_hash)
-        block_hashes.extend(self.cached_block_hashes_by_block.pop(block.block_id, ()))
+        block_hashes.extend(self.cached_block_hashes_by_block.get(block.block_id, ()))
         if not block_hashes:
             return []
+
+        if self.state_observer is not None:
+            self.state_observer(block, "HASH_REMOVING")
+        self.cached_block_hashes_by_block.pop(block.block_id, None)
 
         removed_hashes: list[BlockHashWithGroupId] = []
         for block_hash in block_hashes:
@@ -587,6 +601,9 @@ class BlockPool:
             ):
                 removed_hashes.append(block_hash)
         block.reset_hash()
+        block.cache_mapping_generation += 1
+        if self.state_observer is not None:
+            self.state_observer(block, "HASH_REMOVED")
         return removed_hashes
 
     def _emit_block_removed_events(
@@ -625,6 +642,9 @@ class BlockPool:
                 block_hash_with_group_id
             )
         self.cached_block_hash_to_block.insert(block_hash_with_group_id, block)
+        block.cache_mapping_generation += 1
+        if self.state_observer is not None:
+            self.state_observer(block, "HASH_ADDED")
 
     def move_block_hashes(
         self,
@@ -658,22 +678,31 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        ret: list[KVCacheBlock] = (
+            self.free_block_selector(num_blocks)
+            if self.free_block_selector is not None
+            else self.free_block_queue.popleft_n(num_blocks)
+        )
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
             for block in ret:
                 self._maybe_evict_cached_block(block)
                 assert block.ref_cnt == 0
+                block.allocation_generation += 1
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         else:
             for block in ret:
                 assert block.ref_cnt == 0
+                block.allocation_generation += 1
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
+        if self.state_observer is not None:
+            for block in ret:
+                self.state_observer(block, "ALLOCATED")
         return ret
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
@@ -715,6 +744,8 @@ class BlockPool:
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
+            if self.state_observer is not None:
+                self.state_observer(block, "ACQUIRED")
 
     def is_block_writable(self, block: KVCacheBlock) -> bool:
         """Return whether a block can be mutated by its sole owner."""
@@ -745,6 +776,9 @@ class BlockPool:
         self.free_block_queue.prepend_n(blocks_to_evict_first)
         # Blocks to reuse last are appended to the end of the free queue.
         self.free_block_queue.append_n(blocks_to_evict_last)
+        if self.state_observer is not None:
+            for block in blocks_to_evict_first + blocks_to_evict_last:
+                self.state_observer(block, "RELEASED")
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -764,6 +798,35 @@ class BlockPool:
             )
             block = self.blocks[block_id]
             self._maybe_evict_cached_block(block)
+
+    def evict_if_idle(
+        self,
+        block_id: int,
+        expected_generation: int,
+        expected_mapping_generation: int | None = None,
+    ) -> str:
+        """Revoke an idle allocation's hashes without releasing any reference.
+
+        The engine caller must also check shared policy demand and native
+        transfer fences. A bare block ID is insufficient authority to evict.
+        """
+        block = self.blocks[block_id]
+        if block.is_null:
+            return "NULL_BLOCK"
+        if block.allocation_generation != expected_generation:
+            return "STALE_ALLOCATION"
+        if (
+            expected_mapping_generation is not None
+            and block.cache_mapping_generation != expected_mapping_generation
+        ):
+            return "STALE_MAPPING"
+        if block.ref_cnt:
+            return "IN_USE"
+        if not self._maybe_evict_cached_block(block):
+            return "ABSENT"
+        self.free_block_queue.remove(block)
+        self.free_block_queue.prepend_n([block])
+        return "APPLIED"
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF

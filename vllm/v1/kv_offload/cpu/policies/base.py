@@ -17,13 +17,18 @@ class BlockStatus(ctypes.Structure):
     block_id - index of the physical CPU buffer slot.
     """
 
-    _fields_ = [("ref_cnt", ctypes.c_int32), ("block_id", ctypes.c_int64)]
+    _fields_ = [
+        ("ref_cnt", ctypes.c_int32),
+        ("block_id", ctypes.c_int64),
+        ("allocation_generation", ctypes.c_uint64),
+    ]
 
-    def __init__(self, block_id: int):
+    def __init__(self, block_id: int, allocation_generation: int = 0):
         super().__init__()
         # initialize block as "not ready" (ref_cnt = -1)
         self.ref_cnt = -1
         self.block_id = block_id
+        self.allocation_generation = allocation_generation
 
     @property
     def is_ready(self) -> bool:

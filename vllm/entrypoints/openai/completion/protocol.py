@@ -34,6 +34,7 @@ from vllm.sampling_params import (
 )
 from vllm.utils import random_uuid
 from vllm.utils.collection_utils import is_list_of
+from vllm.v1.kv_control.protocol import KVTransferParams
 
 logger = init_logger(__name__)
 
@@ -209,7 +210,7 @@ class CompletionRequest(OpenAIBaseModel):
         ),
     )
 
-    kv_transfer_params: dict[str, Any] | None = Field(
+    kv_transfer_params: KVTransferParams | None = Field(
         default=None,
         description="KVTransfer parameters used for disaggregated serving.",
     )

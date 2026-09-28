@@ -37,6 +37,9 @@ def register_api_routers(
         register_vllm_dev_api_routers(app)
 
     if "generate" in supported_tasks:
+        from vllm.v1.kv_control.api_router import router as kv_control_router
+
+        app.include_router(kv_control_router)
         from vllm.entrypoints.generate.api_router import (
             register_generate_api_routers,
         )

@@ -84,10 +84,14 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
 
     completed_jobs: dict[int, int] = field(default_factory=dict)
     transfer_stats: TransferStats = field(default_factory=TransferStats)
+    # Only terminal failures whose worker has stopped accessing the buffers.
+    failed_jobs: dict[int, list[str]] = field(default_factory=dict)
 
-    def mark_completed(self, job_id: int) -> None:
+    def mark_completed(self, job_id: int, error: str | None = None) -> None:
         """Record a transfer job completion from this worker."""
         self.completed_jobs[job_id] = 1
+        if error is not None:
+            self.failed_jobs[job_id] = [error]
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -98,7 +102,12 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
         for job_id, v in other.completed_jobs.items():
             merged[job_id] = merged.get(job_id, 0) + v
 
+        failed = {job_id: list(errors) for job_id, errors in self.failed_jobs.items()}
+        for job_id, errors in other.failed_jobs.items():
+            failed.setdefault(job_id, []).extend(errors)
+
         return OffloadingWorkerMetadata(
             completed_jobs=merged,
             transfer_stats=self.transfer_stats.aggregate(other.transfer_stats),
+            failed_jobs=failed,
         )

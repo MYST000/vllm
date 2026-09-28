@@ -226,7 +226,10 @@ class OffloadingConnectorWorker:
         for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
             assert isinstance(src_spec, GPULoadStoreSpec)
             success = self.worker.submit_store(job_id, src_spec, dst_spec)
-            assert success
+            if not success:
+                self._connector_worker_meta.mark_completed(
+                    job_id, error="STORE_SUBMISSION_REJECTED"
+                )
         self._unsubmitted_store_jobs.clear()
 
         if kv_connector_metadata.jobs_to_flush:
@@ -236,7 +239,10 @@ class OffloadingConnectorWorker:
         assert self.worker is not None
         for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
             success = self.worker.submit_store(job_id, src_spec, dst_spec)
-            assert success
+            if not success:
+                self._connector_worker_meta.mark_completed(
+                    job_id, error="STORE_SUBMISSION_REJECTED"
+                )
         self._unsubmitted_store_jobs.clear()
 
         for job_id, entry in metadata.load_jobs.items():
@@ -272,12 +278,15 @@ class OffloadingConnectorWorker:
         assert self.worker is not None
         finished_recving: set[str] = set()
         for transfer_result in self.worker.get_finished():
-            # we currently do not support job failures
             job_id = transfer_result.job_id
-            assert transfer_result.success
             is_load = job_id in self._load_jobs
+            # Load failure retains the native engine-failure contract. A store
+            # failure may be recoverable only after all workers quiesce.
+            if is_load:
+                assert transfer_result.success
             if (
-                transfer_result.transfer_time is not None
+                transfer_result.success
+                and transfer_result.transfer_time is not None
                 and transfer_result.transfer_size is not None
             ):
                 if is_load:
@@ -289,7 +298,9 @@ class OffloadingConnectorWorker:
                     transfer_result.transfer_time,
                 )
 
-            self._connector_worker_meta.mark_completed(job_id)
+            self._connector_worker_meta.mark_completed(
+                job_id, error=None if transfer_result.success else "STORE_FAILED"
+            )
             req_id = self._load_jobs.pop(job_id, None)
             if req_id is not None:
                 finished_recving.add(req_id)

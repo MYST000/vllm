@@ -273,6 +273,12 @@ class LLMEngine:
         n = params.n if isinstance(params, SamplingParams) else 1
 
         if n == 1:
+            if request.sampling_params is not None:
+                from vllm.v1.kv_control.ingress import bind_choice
+
+                request.sampling_params = bind_choice(
+                    request.sampling_params, req_id, 0, 1
+                )
             # Make a new RequestState and queue.
             self.output_processor.add_request(request, prompt_text, None, 0)
             # Add the request to EngineCore.
@@ -286,6 +292,11 @@ class LLMEngine:
             child_request = request if idx == n - 1 else copy(request)
             child_request.request_id = request_id
             child_request.sampling_params = child_params
+            from vllm.v1.kv_control.ingress import bind_choice
+
+            child_request.sampling_params = bind_choice(
+                child_params, parent_req.request_id, idx, n
+            )
 
             # Make a new RequestState and queue.
             self.output_processor.add_request(

@@ -499,6 +499,15 @@ class AsyncLLM(EngineClient):
         index: int,
         queue: RequestOutputCollector,
     ):
+        if request.sampling_params is not None:
+            from vllm.v1.kv_control.ingress import bind_choice
+
+            request.sampling_params = bind_choice(
+                request.sampling_params,
+                parent_req.request_id if parent_req else request.request_id,
+                index,
+                parent_req.n if parent_req else 1,
+            )
         if parent_req is None and not self.output_processor.has_request(
             request.request_id
         ):

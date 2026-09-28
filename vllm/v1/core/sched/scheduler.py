@@ -55,6 +55,8 @@ from vllm.v1.core.sched.request_queue import (
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_control.manager import METADATA_KEY, KVControlManager
+from vllm.v1.kv_control.protocol import KVControlConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import (
     PrefixCacheStats,
@@ -72,6 +74,8 @@ logger = init_logger(__name__)
 
 
 class Scheduler(SchedulerInterface):
+    kv_control: KVControlManager | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -305,6 +309,27 @@ class Scheduler(SchedulerInterface):
         if self.connector is not None:
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
 
+        extra = vllm_config.additional_config
+        control_config = KVControlConfig.model_validate(
+            extra.get("kv_control", {}) if isinstance(extra, dict) else {}
+        )
+        if control_config.enabled:
+            from vllm.distributed.kv_transfer.kv_connector.v1 import (
+                offloading_connector,
+            )
+
+            if not isinstance(self.connector, offloading_connector.OffloadingConnector):
+                raise ValueError(
+                    "KV control requires OffloadingConnector + CPUOffloadingSpec"
+                )
+            assert self.connector.connector_scheduler is not None
+            self.kv_control = KVControlManager(
+                control_config,
+                vllm_config,
+                self.kv_cache_manager,
+                self.connector.connector_scheduler,
+            )
+
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
@@ -499,6 +524,8 @@ class Scheduler(SchedulerInterface):
         return max(num_new_tokens, 0)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        if self.kv_control is not None:
+            self.kv_control.begin_step()
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -1381,6 +1408,8 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if self.kv_control is not None:
+            self.kv_control.end_schedule(scheduler_output)
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -1804,6 +1833,8 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        if self.kv_control is not None:
+            self.kv_control.complete_step(scheduler_output)
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -2401,6 +2432,8 @@ class Scheduler(SchedulerInterface):
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
+            if self.kv_control is not None:
+                self.kv_control.on_request(request)
             if request.resumable:
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
@@ -2483,7 +2516,13 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
 
         self._inflight_prefills.discard(request)
+        control_metadata = (
+            self.kv_control.finish(request) if self.kv_control is not None else None
+        )
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+        if control_metadata is not None:
+            kv_xfer_params = dict(kv_xfer_params or {})
+            kv_xfer_params[METADATA_KEY] = control_metadata
 
         # EC Connector: mirror the KV hook. The contract requires firing
         # before the encoder cache is freed so the connector can inspect
@@ -2611,6 +2650,8 @@ class Scheduler(SchedulerInterface):
         Otherwise, this method will only reset the KV prefix cache when there
         is no running requests taking KV cache.
         """
+        if self.kv_control is not None:
+            self.kv_control.invalidate()
         if reset_running_requests:
             # For logging.
             timestamp = time.monotonic()

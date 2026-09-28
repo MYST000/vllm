@@ -51,3 +51,15 @@ def test_aggregate_transfer_stats():
     assert result.transfer_stats.load.bytes == 30
     assert result.transfer_stats.load.time == 1.5
     assert result.transfer_stats.load.sizes == [10, 20, 30]
+
+
+def test_failed_rank_does_not_disappear_in_successful_rank_aggregation():
+    failed = OffloadingWorkerMetadata()
+    failed.mark_completed(42, error="store rejected before submission")
+    writer = OffloadingWorkerMetadata()
+    writer.mark_completed(42)
+    non_writer = OffloadingWorkerMetadata()
+    non_writer.mark_completed(42)
+    result = writer.aggregate(failed).aggregate(non_writer)
+    assert result.completed_jobs == {42: 3}
+    assert result.failed_jobs == {42: ["store rejected before submission"]}

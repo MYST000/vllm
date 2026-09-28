@@ -175,6 +175,9 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     max_tokens,
                     self.default_sampling_params,
                 )
+                from vllm.v1.kv_control.ingress import bind_input
+
+                sampling_params = bind_input(sampling_params, i, len(engine_inputs))
 
             request_id_item = f"{request_id}-{i}"
 

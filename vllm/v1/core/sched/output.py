@@ -253,6 +253,8 @@ class SchedulerOutput:
     free_encoder_mm_hashes: list[str]
 
     scheduled_encoder_input_stats: ScheduledEncoderInputStats | None = None
+    # Correlates metadata publication with completed writes, including CoW.
+    kv_control_step: int | None = None
 
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.

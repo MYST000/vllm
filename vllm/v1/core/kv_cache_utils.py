@@ -181,6 +181,10 @@ class KVCacheBlock:
 
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
+    # Changes only when the allocator assigns this slot to a new owner.
+    allocation_generation: int = 0
+    # Hash aliases may change without reallocating this physical slot.
+    cache_mapping_generation: int = 0
 
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:

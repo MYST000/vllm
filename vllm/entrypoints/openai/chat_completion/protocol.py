@@ -50,6 +50,7 @@ from vllm.sampling_params import (
     ThinkingTokenBudget,
 )
 from vllm.utils import random_uuid
+from vllm.v1.kv_control.protocol import KVTransferParams
 
 logger = init_logger(__name__)
 
@@ -477,7 +478,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ),
     )
 
-    kv_transfer_params: dict[str, Any] | None = Field(
+    kv_transfer_params: KVTransferParams | None = Field(
         default=None,
         description="KVTransfer parameters used for disaggregated serving.",
     )

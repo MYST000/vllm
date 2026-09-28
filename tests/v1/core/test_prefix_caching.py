@@ -54,6 +54,31 @@ from vllm.v1.kv_cache_interface import (
 pytestmark = pytest.mark.cpu_test
 
 
+def test_targeted_eviction_never_releases_holds_or_reused_allocations():
+    pool = BlockPool(2, enable_caching=True, hash_block_size=4)
+    block = pool.get_new_blocks(1)[0]
+    generation = block.allocation_generation
+    key = make_block_hash_with_group_id(BlockHash(b"prefix"), 0)
+    block.set_block_hash(key)
+    pool.cached_block_hash_to_block.insert(key, block)
+    pool.cached_block_hashes_by_block[block.block_id] = {key}
+    pool.touch([block])
+    pool.free_blocks([block])
+    assert pool.evict_if_idle(block.block_id, generation) == "IN_USE"
+    assert block.block_hash == key
+    pool.free_blocks([block])
+    assert pool.evict_if_idle(block.block_id, generation) == "APPLIED"
+    assert pool.get_num_free_blocks() == 1
+    assert block.ref_cnt == 0
+    assert block.block_hash is None
+    assert pool.evict_if_idle(block.block_id, generation) == "ABSENT"
+    assert pool.get_new_blocks(1)[0] is block
+    assert block.allocation_generation > generation
+    assert pool.evict_if_idle(block.block_id, generation) == "STALE_ALLOCATION"
+    pool.free_blocks([block])
+    assert pool.get_num_free_blocks() == 1
+
+
 @pytest.fixture(autouse=True)
 def _auto_init_hash_fn(request):
     hash_fn: Callable

@@ -32,6 +32,52 @@ from vllm.v1.kv_cache_interface import (
 pytestmark = pytest.mark.cpu_test
 
 
+@pytest.mark.parametrize("shared_blocks", [0, 1, 2])
+@pytest.mark.parametrize("protection_refs", [0, 1, 3])
+def test_common_prefix_uses_request_membership(shared_blocks, protection_refs):
+    """GRACE/transfer holds must neither create nor hide cascade sharing."""
+    spec = FullAttentionSpec(
+        block_size=4, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    pool = BlockPool(num_gpu_blocks=10, enable_caching=True, hash_block_size=4)
+    manager = FullAttentionManager(
+        spec,
+        block_pool=pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=4,
+    )
+    first = pool.get_new_blocks(2)
+    second = first[:shared_blocks] + pool.get_new_blocks(2 - shared_blocks)
+    pool.touch(first[:shared_blocks])
+    manager.req_to_blocks["a"] = first
+    manager.req_to_blocks["b"] = second
+    if shared_blocks < 2:
+        alias = make_block_hash_with_group_id(BlockHash(b"same-content"), 0)
+        first[shared_blocks].set_block_hash(alias)
+        second[shared_blocks].set_block_hash(alias)
+    for _ in range(protection_refs):
+        pool.touch(first)
+    assert manager.get_num_common_prefix_blocks("a") == shared_blocks
+    assert manager.get_num_common_prefix_blocks("b") == shared_blocks
+
+    # An allocated but unscheduled request still participates; missing positions
+    # and the null block cannot extend a physical shared prefix.
+    manager.req_to_blocks["c"] = first[:1]
+    assert manager.get_num_common_prefix_blocks("a") == min(1, shared_blocks)
+    manager.req_to_blocks["c"] = [pool.null_block]
+    assert manager.get_num_common_prefix_blocks("a") == 0
+    del manager.req_to_blocks["c"]
+    del manager.req_to_blocks["b"]
+    pool.free_blocks(second)
+    assert manager.get_num_common_prefix_blocks("a") == 2
+    for _ in range(protection_refs):
+        pool.free_blocks(first)
+    del manager.req_to_blocks["a"]
+    pool.free_blocks(first)
+    assert pool.get_num_free_blocks() == 9
+
+
 def test_external_computed_blocks_do_not_corrupt_free_pool():
     block_size = 4
     spec = FullAttentionSpec(

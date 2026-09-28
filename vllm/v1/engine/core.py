@@ -118,6 +118,16 @@ class EngineCore:
 
         load_general_plugins()
 
+        extra = vllm_config.additional_config
+        if (
+            type(self) is EngineCore
+            and isinstance(extra, dict)
+            and extra.get("kv_control", {}).get("enabled", False)
+        ):
+            raise ValueError(
+                "KV control requires EngineCoreProc's autonomous idle loop; "
+                "enable VLLM_ENABLE_V1_MULTIPROCESSING."
+            )
         self.vllm_config = vllm_config
         if not vllm_config.parallel_config.data_parallel_rank_local:
             logger.info(
@@ -627,6 +637,9 @@ class EngineCore:
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
     def post_step(self, model_executed: bool) -> None:
+        control = getattr(self.scheduler, "kv_control", None)
+        if control is not None:
+            control.poll()
         # When using async scheduling we can't get draft token ids in advance,
         # so we update draft token ids in the worker process and don't
         # need to update draft token ids here.
@@ -803,6 +816,66 @@ class EngineCore:
         return self.scheduler.reset_prefix_cache(
             reset_running_requests, reset_connector
         )
+
+    def kv_control_capabilities(self) -> dict[str, Any]:
+        control = getattr(self.scheduler, "kv_control", None)
+        if control is None:
+            return {"kv_control_error": "KV_CONTROL_DISABLED"}
+        return control.capabilities().model_dump(mode="json")
+
+    def query_kv_descriptor(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from vllm.v1.kv_control.protocol import QueryRequest
+
+        return self._kv_control_call("query", QueryRequest.model_validate(payload))
+
+    def query_target_prefix(
+        self, request: EngineCoreRequest, expected_engine_epoch: str, query_id: str
+    ) -> dict[str, Any]:
+        from vllm.v1.kv_control.manager import KVControlError
+
+        control = getattr(self.scheduler, "kv_control", None)
+        if control is None:
+            return {"kv_control_error": "KV_CONTROL_DISABLED"}
+        target = Request.from_engine_core_request(request, self.request_block_hasher)
+        try:
+            return control.query_target(
+                target, expected_engine_epoch, query_id
+            ).model_dump(mode="json")
+        except KVControlError as exc:
+            return {"kv_control_error": exc.code}
+
+    def apply_kv_policy(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from vllm.v1.kv_control.protocol import PolicyRequest
+
+        return self._kv_control_call("apply", PolicyRequest.model_validate(payload))
+
+    def kv_operation_status(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from vllm.v1.kv_control.protocol import OperationQuery
+
+        return self._kv_control_call("status", OperationQuery.model_validate(payload))
+
+    def resolve_finished_descriptor(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from vllm.v1.kv_control.protocol import CallBinding
+
+        return self._kv_control_call("resolve", CallBinding.model_validate(payload))
+
+    def kv_control_telemetry(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from vllm.v1.kv_control.protocol import TelemetryRequest
+
+        return self._kv_control_call(
+            "telemetry", TelemetryRequest.model_validate(payload)
+        )
+
+    def _kv_control_call(self, method: str, payload: Any) -> dict[str, Any]:
+        from vllm.v1.kv_control.manager import KVControlError
+
+        control = getattr(self.scheduler, "kv_control", None)
+        if control is None:
+            return {"kv_control_error": "KV_CONTROL_DISABLED"}
+        try:
+            return getattr(control, method)(payload).model_dump(mode="json")
+        except KVControlError as exc:
+            return {"kv_control_error": exc.code}
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
@@ -1438,6 +1511,9 @@ class EngineCoreProc(EngineCore):
         """Exits when an engine step needs to be performed."""
 
         waited = False
+        control = getattr(self.scheduler, "kv_control", None)
+        if control is not None:
+            control.poll()
         while not self.has_work() and self.is_running():
             # Notify callbacks waiting for engine to become idle.
             self._notify_idle_state_callbacks()
@@ -1450,10 +1526,16 @@ class EngineCoreProc(EngineCore):
                     waited = True
             block = self.process_input_queue_block
             try:
-                req = self.input_queue.get(block=block)
+                timeout = (
+                    control.next_timeout() if control is not None and block else None
+                )
+                req = self.input_queue.get(block=block, timeout=timeout)
                 self._handle_client_request(*req)
             except queue.Empty:
-                break
+                if control is None or not block:
+                    break
+            if control is not None:
+                control.poll()
             if not block:
                 break
 
